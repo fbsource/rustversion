@@ -59,6 +59,19 @@ fn main() {
             }
         };
 
+        // Meta-local overlay: RUSTC_BOOTSTRAP=1 unlocks nightly features on a
+        // stable rustc. The rest of the build will treat this rustc as a
+        // capable-of-nightly compiler, so promote a `Stable` parse to `Nightly`
+        // (using the rustc release date already embedded in the version line)
+        // before the parser runs. This makes date-based gates like
+        // #[rustversion::since(YYYY-MM-DD)] match the rustc's release date.
+        let string = if env::var_os("RUSTC_BOOTSTRAP").as_deref() == Some(std::ffi::OsStr::new("1"))
+        {
+            promote_stable_to_nightly(&string)
+        } else {
+            string
+        };
+
         break match rustc::parse(&string) {
             rustc::ParseResult::Success(version) => version,
             rustc::ParseResult::OopsClippy if !is_clippy_driver => {
@@ -101,6 +114,50 @@ fn main() {
     if let Some("windows") = host.to_str().unwrap().split('-').nth(2) {
         println!("cargo:rustc-cfg=host_os=\"windows\"");
     }
+}
+
+// Rewrites `rustc 1.X.Y (HASH DATE)` to `rustc 1.X.Y-nightly (HASH DATE)` so
+// the existing parser's nightly branch picks up the date. No-op if a channel
+// suffix is already present (`-nightly`, `-beta`, `-dev`).
+fn promote_stable_to_nightly(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + "-nightly".len());
+    let mut promoted = false;
+    for line in input.split_inclusive('\n') {
+        if !promoted {
+            if let Some(rewritten) = try_promote_line(line) {
+                out.push_str(&rewritten);
+                promoted = true;
+                continue;
+            }
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+fn try_promote_line(line: &str) -> Option<String> {
+    let trimmed = line.trim_end_matches(|c| c == '\r' || c == '\n');
+    let trailing = &line[trimmed.len()..];
+    let mut words = trimmed.split(' ');
+    if words.next()? != "rustc" {
+        return None;
+    }
+    let version = words.next()?;
+    if version.contains('-') {
+        // Already has a channel suffix.
+        return None;
+    }
+    let rest = words.collect::<Vec<_>>().join(" ");
+    let mut rewritten = String::with_capacity(line.len() + "-nightly".len());
+    rewritten.push_str("rustc ");
+    rewritten.push_str(version);
+    rewritten.push_str("-nightly");
+    if !rest.is_empty() {
+        rewritten.push(' ');
+        rewritten.push_str(&rest);
+    }
+    rewritten.push_str(trailing);
+    Some(rewritten)
 }
 
 // Shim Version's {:?} format into a {} format, because {:?} is unusable in
